@@ -6,7 +6,6 @@ from fastapi.responses import JSONResponse
 from transformers import WavLMForXVector, Wav2Vec2FeatureExtractor
 import librosa
 import torch
-from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -16,9 +15,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("VG")
 
 SR = 16000
-THRESHOLD = float(os.environ.get("VG_THRESHOLD", "0.72"))
 PORT = int(os.environ.get("PORT", "8080"))
 MODEL_NAME = "microsoft/wavlm-base-plus-sv"
+
+# مجلد تخزين النموذج هيتعمل تلقائياً
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "voxguard")
 
 _wavlm_model, _wavlm_ext = None, None
 
@@ -26,18 +27,31 @@ def _load_wavlm():
     global _wavlm_model, _wavlm_ext
     try:
         t0 = time.time()
-        log.info("⏳ Loading WavLM model...")
-        _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
-        _wavlm_model = WavLMForXVector.from_pretrained(MODEL_NAME).eval()
-        log.info(f"✅ WavLM model loaded in {int((time.time()-t0)*1000)}ms")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        
+        # نحاول نحمل من الكاش الأول
+        try:
+            log.info("Checking cache...")
+            _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained(
+                MODEL_NAME, cache_dir=CACHE_DIR, local_files_only=True
+            )
+            _wavlm_model = WavLMForXVector.from_pretrained(
+                MODEL_NAME, cache_dir=CACHE_DIR, local_files_only=True
+            ).eval()
+            log.info(f"✅ WavLM loaded from cache in {int((time.time()-t0)*1000)}ms")
+        except:
+            # لو مش موجود، نحمل من الإنترنت أول مرة
+            log.info("First run - downloading model (one-time only)...")
+            _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+            _wavlm_model = WavLMForXVector.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR).eval()
+            log.info(f"✅ WavLM downloaded and cached in {int((time.time()-t0)*1000)}ms")
+        
         return True
     except Exception as e:
         log.error(f"❌ Failed to load WavLM: {e}")
         return False
 
 def get_embedding(audio: np.ndarray):
-    if _wavlm_model is None or _wavlm_ext is None:
-        raise HTTPException(503, "Model is not ready yet.")
     with torch.no_grad():
         inp = _wavlm_ext(audio, sampling_rate=SR, return_tensors="pt", padding=True)
         emb = _wavlm_model(**inp).embeddings.squeeze().cpu().numpy().astype(np.float32)
@@ -46,7 +60,7 @@ def get_embedding(audio: np.ndarray):
 def load_wav(raw: bytes):
     if not raw: raise ValueError("empty audio")
     arr, _ = librosa.load(io.BytesIO(raw), sr=SR, mono=True)
-    return arr.astype(np.float32)[:SR * 4]
+    return arr.astype(np.float32)[:SR*3]  # 3 ثواني بس للسرعة
 
 def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
@@ -56,15 +70,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 async def startup_event():
-    log.info("Application startup - loading model...")
     if not _load_wavlm():
-        log.error("Could not load model at startup.")
-    else:
-        log.info("Model loaded and ready.")
+        log.error("Model failed to load")
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "wavlm_loaded": _wavlm_model is not None}
+    return {"ok": _wavlm_model is not None}
 
 @app.post("/enroll")
 async def enroll(
@@ -74,19 +85,18 @@ async def enroll(
     audio_3: UploadFile = File(...),
 ):
     if _wavlm_model is None:
-        _load_wavlm()
-    if _wavlm_model is None:
-        raise HTTPException(503, "Model failed to load")
+        raise HTTPException(503, "Model not loaded")
 
     t0 = time.time()
     
-    # قراءة الملفات أولاً (لازم تكون async)
+    # قراءة كل الملفات الأول
     raws = []
     for f in [audio_1, audio_2, audio_3]:
         raw = await f.read()
         raws.append(raw)
     
-    # المعالجة المتوازية
+    # معالجة متوازية
+    from concurrent.futures import ThreadPoolExecutor
     embeddings = []
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(get_embedding, load_wav(raw)) for raw in raws]
@@ -107,12 +117,11 @@ async def enroll(
 async def verify(
     audio: UploadFile = File(...),
     embedding: str = Form(...),
-    threshold: float = Form(THRESHOLD),
+    threshold: float = Form(0.72),
 ):
     if _wavlm_model is None:
-        _load_wavlm()
-    if _wavlm_model is None:
-        raise HTTPException(503, "Model failed to load")
+        raise HTTPException(503, "Model not loaded")
+    
     try:
         saved_emb = np.array(json.loads(embedding), dtype=np.float32)
     except:
@@ -122,7 +131,7 @@ async def verify(
     raw = await audio.read()
     wav = load_wav(raw)
     
-    # تشغيل get_embedding في thread منفصل عشان Async
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(get_embedding, wav)
         new_emb = future.result()
@@ -143,3 +152,4 @@ async def catch_all(path: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+    
