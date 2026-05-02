@@ -2,8 +2,8 @@ import io, os, json, time, logging, warnings
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# إخفاء التحذيرات المزعجة
 warnings.filterwarnings("ignore")
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -15,7 +15,6 @@ SR = 16000
 THRESHOLD = float(os.environ.get("VG_THRESHOLD", "0.72"))
 PORT = int(os.environ.get("PORT", "8000"))
 
-# ─── WavLM Model ───
 _wavlm_model, _wavlm_ext, _wavlm_ok, _load_err = None, None, False, ""
 
 def _load_wavlm():
@@ -62,7 +61,6 @@ log.info("Loading WavLM...")
 _wavlm_ok = _load_wavlm()
 log.info(f"WavLM: {'OK' if _wavlm_ok else 'FAILED'}")
 
-# ─── FastAPI App ───
 app = FastAPI(title="VoxGuard API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -77,19 +75,24 @@ async def enroll(
     audio_2: UploadFile = File(...),
     audio_3: UploadFile = File(...),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model: {_load_err}")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
     t0 = time.time()
     embeddings = []
     for f in [audio_1, audio_2, audio_3]:
-        wav = load_wav(await f.read())
-        embeddings.append(get_embedding(wav))
+        raw = await f.read()
+        wav = load_wav(raw)
+        emb = get_embedding(wav)
+        embeddings.append(emb)
     final = np.mean(embeddings, axis=0)
     n = float(np.linalg.norm(final))
-    final = final / n if n > 1e-8 else final
+    if n > 1e-8:
+        final = final / n
     return {
-        "ok": True, "user_id": user_id, "dim": len(final),
+        "ok": True,
+        "user_id": user_id,
+        "dim": int(len(final)),
         "embedding": final.tolist(),
-        "ms": round((time.time()-t0)*1000)
+        "ms": int((time.time() - t0) * 1000)
     }
 
 @app.post("/verify_embedding")
@@ -97,25 +100,26 @@ async def verify_embedding(
     audio: UploadFile = File(...),
     embedding: str = Form(...),
     threshold: float = Form(0.72),
-    user_id: str = Form(""),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model: {_load_err}")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
     try:
         saved_emb = np.array(json.loads(embedding), dtype=np.float32)
-    except:
-        raise HTTPException(400, "Invalid embedding")
+    except Exception:
+        raise HTTPException(400, "Invalid embedding JSON")
     t0 = time.time()
-    wav = load_wav(await audio.read())
+    raw = await audio.read()
+    wav = load_wav(raw)
     new_emb = get_embedding(wav)
     score = cosine_sim(new_emb, saved_emb)
     match = bool(score >= threshold)
     return {
-        "ok": True, "match": match, "score": round(score, 4),
-        "sos_trigger": match, "user_id": user_id,
-        "ms": round((time.time()-t0)*1000)
+        "ok": True,
+        "match": match,
+        "score": round(float(score), 4),
+        "sos_trigger": match,
+        "ms": int((time.time() - t0) * 1000)
     }
 
-# Catch-all
 @app.api_route("/{path:path}")
 async def catch_all(path: str):
     return JSONResponse({"ok": False, "error": f"/{path} not found"}, status_code=404)
