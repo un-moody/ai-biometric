@@ -1,148 +1,340 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VoxGuard API - WavLM-SV Only
-Fast, Clean, Single-Model Voice Biometric
+================================================================================
+  VoxGuard Voice Biometric API - Production Ready
+================================================================================
+
+Fast, clean, production-ready voice biometric API with WavLM embeddings.
+
+Endpoints:
+    POST   /enroll   - Register user with 3 WAV samples
+    POST   /verify   - Verify user identity with 1 WAV sample
+    GET    /health   - Service health check
+
+================================================================================
 """
 
-import io
 import os
 import json
 import time
-import logging
 import asyncio
+import sqlite3
+import logging
+import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import numpy as np
-import torch
+import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import WavLMForXVector, Wav2Vec2FeatureExtractor
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# Configuration
+# ============================================================================
 
 SR = 16000
-PORT = int(os.environ.get("PORT", "9000"))
 THRESHOLD = float(os.environ.get("VG_THRESHOLD", "0.72"))
-DEVICE = "cpu"
+PORT = int(os.environ.get("PORT", "9000"))
+DB_PATH = os.environ.get("VG_DB_PATH", "voxguard.db")
+MODEL_PATH = os.environ.get("WAVLM_PATH", "wavlm_model")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("VG")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("voxguard")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODEL - Load once at startup
-# ═══════════════════════════════════════════════════════════════════════════════
+_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
-model = None
-extractor = None
-model_ready = False
+# ============================================================================
+# Database Layer (Compatible with existing databases)
+# ============================================================================
 
-def load_model():
-    """تحميل WavLM مرة واحدة عند بداية التشغيل"""
-    global model, extractor, model_ready
+_db: dict = {}
+_db_lock = threading.Lock()
+
+
+def _init_db():
+    """Initialize SQLite database - handles existing schemas gracefully"""
+    global _db
     
-    t0 = time.time()
-    log.info("Loading WavLM-SV...")
+    conn = sqlite3.connect(DB_PATH)
     
+    # Check if users table exists
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    table_exists = cursor.fetchone() is not None
+    
+    if not table_exists:
+        # Create new table
+        conn.execute("""
+            CREATE TABLE users (
+                user_id TEXT PRIMARY KEY,
+                embedding TEXT NOT NULL,
+                name TEXT,
+                enrolled_at TEXT,
+                dim INTEGER DEFAULT 512
+            )
+        """)
+        log.info("Created new users table")
+    else:
+        # Check existing columns
+        cursor = conn.execute("PRAGMA table_info(users)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        # Add missing columns if needed
+        if "user_id" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN user_id TEXT")
+        if "embedding" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN embedding TEXT")
+        if "name" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
+        if "enrolled_at" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN enrolled_at TEXT")
+        if "dim" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN dim INTEGER DEFAULT 512")
+        
+        log.info("Verified table schema")
+    
+    # Load existing users
     try:
-        extractor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv")
-        model = WavLMForXVector.from_pretrained(
-            "microsoft/wavlm-base-plus-sv",
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True
-        ).eval()
-        
-        model_ready = True
-        log.info(f"✅ WavLM ready in {int((time.time()-t0)*1000)}ms")
-        
-        # تسخين - أول طلب بعد كده هيبقى سريع
-        log.info("🔥 Warming up...")
-        dummy = np.zeros(SR * 2, dtype=np.float32)
-        _ = extract_embedding(dummy)
-        log.info("✅ Warmup done")
-        
-    except Exception as e:
-        log.error(f"❌ Failed to load WavLM: {e}")
-        model_ready = False
-
-
-def extract_embedding(audio: np.ndarray) -> np.ndarray:
-    """استخراج بصمة 512-dim من الصوت"""
-    audio = audio[:SR * 8]  # max 8 seconds
+        cursor = conn.execute("SELECT user_id, embedding, name, enrolled_at FROM users WHERE user_id IS NOT NULL AND embedding IS NOT NULL")
+        for row in cursor.fetchall():
+            uid, emb_json, name, ts = row
+            if uid and emb_json:
+                try:
+                    _db[uid] = {
+                        "embedding": json.loads(emb_json),
+                        "name": name or uid,
+                        "enrolled_at": ts or ""
+                    }
+                except json.JSONDecodeError:
+                    log.warning(f"Invalid embedding for user {uid}, skipping")
+    except sqlite3.OperationalError as e:
+        log.warning(f"Could not load existing users: {e}")
     
-    with torch.inference_mode():
-        inputs = extractor(audio, sampling_rate=SR, return_tensors="pt", padding=True)
-        emb = model(**inputs).embeddings
-        emb = torch.nn.functional.normalize(emb, p=2, dim=-1)
+    conn.close()
+    log.info(f"Database ready: {len(_db)} user(s) loaded")
+
+
+def _save_user(user_id: str, data: dict):
+    """Save or update user in database"""
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO users (user_id, embedding, name, enrolled_at, dim) VALUES (?, ?, ?, ?, ?)",
+            (user_id, json.dumps(data["embedding"]), data["name"], data["enrolled_at"], 512)
+        )
+        conn.commit()
+        conn.close()
+
+
+def _delete_user(user_id: str):
+    """Delete user from database"""
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+
+
+# Initialize database with error handling
+try:
+    _init_db()
+except Exception as e:
+    log.error(f"Database init failed: {e}")
+    log.info("Creating fresh database...")
+    # Backup old if exists
+    if Path(DB_PATH).exists():
+        backup_path = f"{DB_PATH}.backup"
+        Path(DB_PATH).rename(backup_path)
+        log.info(f"Backed up old database to {backup_path}")
+    _init_db()  # Try again with fresh DB
+
+# ============================================================================
+# Audio Processing
+# ============================================================================
+
+def _load_wav_pcm(raw: bytes) -> np.ndarray:
+    """Load standard PCM WAV (fast path)"""
+    import wave
+    import io
     
-    return emb.squeeze().cpu().numpy().astype(np.float32)
+    with wave.open(io.BytesIO(raw), "rb") as wf:
+        nchan = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+    
+    # Convert to float32
+    if sampwidth == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 1:
+        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sampwidth == 3:
+        bytes_arr = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3)
+        audio = np.zeros(len(bytes_arr), dtype=np.int32)
+        for i in range(len(bytes_arr)):
+            audio[i] = (bytes_arr[i, 0] | (bytes_arr[i, 1] << 8) | (bytes_arr[i, 2] << 16))
+        audio = audio.astype(np.float32) / 8388608.0
+    else:
+        raise ValueError(f"Unsupported sample width: {sampwidth}")
+    
+    # Convert to mono
+    if nchan > 1:
+        audio = audio.reshape(-1, nchan).mean(axis=1)
+    
+    # Resample if needed
+    if framerate != SR:
+        ratio = SR / framerate
+        new_len = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, new_len)
+        audio = np.interp(indices, np.arange(len(audio)), audio)
+    
+    return audio.astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUDIO LOADING
-# ═══════════════════════════════════════════════════════════════════════════════
+def _load_wav_scipy(raw: bytes) -> np.ndarray:
+    """Fallback using scipy"""
+    import io
+    from scipy.io import wavfile
+    
+    sr, audio = wavfile.read(io.BytesIO(raw))
+    
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    elif audio.dtype == np.int32:
+        audio = audio.astype(np.float32) / 2147483648.0
+    else:
+        audio = audio.astype(np.float32)
+    
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    
+    if sr != SR:
+        ratio = SR / sr
+        new_len = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, new_len)
+        audio = np.interp(indices, np.arange(len(audio)), audio)
+    
+    return audio.astype(np.float32)
+
 
 def load_audio(raw: bytes) -> np.ndarray:
-    """تحميل الصوت - WAV raw bytes → float32 numpy array @ 16kHz"""
+    """Load and convert audio to 16kHz mono float32"""
     if not raw:
-        raise ValueError("Empty audio")
+        raise ValueError("Empty audio data")
     
-    # نحاول soundfile الأول (أسرع)
+    # Try pure Python first (fastest)
     try:
-        import soundfile as sf
-        arr, orig_sr = sf.read(io.BytesIO(raw), dtype="float32")
-        if arr.ndim > 1:
-            arr = arr.mean(axis=1)
-        if orig_sr != SR:
-            from scipy.signal import resample_poly
-            from math import gcd
-            g = gcd(orig_sr, SR)
-            arr = resample_poly(arr, SR // g, orig_sr // g).astype(np.float32)
-        return arr.astype(np.float32)
-    except:
+        return _load_wav_pcm(raw)
+    except Exception:
         pass
     
-    # fallback: librosa
+    # Fallback to scipy
     try:
-        import librosa
-        arr, _ = librosa.load(io.BytesIO(raw), sr=SR, mono=True)
-        return arr.astype(np.float32)
-    except:
-        pass
+        return _load_wav_scipy(raw)
+    except Exception as e:
+        raise ValueError(f"Failed to decode audio: {e}")
+
+
+# ============================================================================
+# WavLM Model
+# ============================================================================
+
+_model = None
+_extractor = None
+_model_ready = False
+_model_error = ""
+
+
+def _load_model():
+    """Load WavLM model (called once on startup)"""
+    global _model, _extractor, _model_ready, _model_error
     
-    raise ValueError("Cannot decode audio - use WAV format")
+    try:
+        import torch
+        from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+    except ImportError as e:
+        _model_error = f"Missing dependencies: {e}"
+        log.error(_model_error)
+        return False
+    
+    # Try local path first
+    if Path(MODEL_PATH).exists():
+        try:
+            _extractor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_PATH, local_files_only=True)
+            _model = WavLMForXVector.from_pretrained(MODEL_PATH, local_files_only=True).eval()
+            log.info(f"Model loaded from {MODEL_PATH}")
+            _model_ready = True
+            return True
+        except Exception as e:
+            log.warning(f"Local load failed: {e}")
+    
+    # Download from HuggingFace
+    try:
+        log.info("Downloading WavLM model (first run only)...")
+        _extractor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv")
+        _model = WavLMForXVector.from_pretrained("microsoft/wavlm-base-plus-sv").eval()
+        log.info("Model ready")
+        _model_ready = True
+        return True
+    except Exception as e:
+        _model_error = f"Download failed: {e}"
+        log.error(_model_error)
+        return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# IN-MEMORY DATABASE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-db: dict = {}  # {user_id: {"name": str, "embedding": list, "enrolled_at": str}}
+log.info("Loading WavLM model...")
+_load_model()
+log.info(f"Model status: {'READY' if _model_ready else 'FAILED'}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FASTAPI APP
-# ═══════════════════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="VoxGuard API", version="3.0.0", docs_url="/docs")
-
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-executor = ThreadPoolExecutor(max_workers=4)
-
-
-@app.on_event("startup")
-async def startup():
-    """تحميل النموذج عند بداية التشغيل"""
-    await asyncio.get_event_loop().run_in_executor(executor, load_model)
+def get_embedding(audio: np.ndarray) -> np.ndarray:
+    """Extract 512-dim speaker embedding"""
+    if not _model_ready:
+        raise RuntimeError(f"Model not ready: {_model_error}")
+    
+    import torch
+    with torch.no_grad():
+        inputs = _extractor(audio, sampling_rate=SR, return_tensors="pt", padding=True)
+        embedding = _model(**inputs).embeddings.squeeze().cpu().numpy()
+    
+    # L2 normalize
+    norm = np.linalg.norm(embedding)
+    return embedding / norm if norm > 1e-8 else embedding
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENROLL
-# ═══════════════════════════════════════════════════════════════════════════════
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors"""
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+app = FastAPI(
+    title="VoxGuard Voice Biometric API",
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
 
 @app.post("/enroll")
 async def enroll(
@@ -152,79 +344,66 @@ async def enroll(
     audio_2: UploadFile = File(...),
     audio_3: UploadFile = File(...),
 ):
-    """
-    تسجيل بصمة من 3 عينات
+    """Enroll a new user with 3 voice samples"""
+    if not _model_ready:
+        raise HTTPException(503, f"Model not ready: {_model_error}")
     
-    - يتحقق إن العينات الـ 3 لنفس الشخص (cross-check)
-    - ياخد المتوسط ويخزنه
-    """
-    if not model_ready:
-        raise HTTPException(503, "Model not ready")
+    start_time = time.time()
     
-    t0 = time.time()
+    async def load_sample(file: UploadFile, idx: int):
+        raw = await file.read()
+        audio = await asyncio.get_event_loop().run_in_executor(_EXECUTOR, load_audio, raw)
+        
+        duration = len(audio) / SR
+        if duration < 1.0:
+            raise HTTPException(400, f"Sample {idx} too short ({duration:.2f}s), need ≥1.0s")
+        
+        rms = float(np.sqrt(np.mean(audio**2)))
+        if rms < 0.006:
+            raise HTTPException(400, f"Sample {idx} too silent (RMS={rms:.4f})")
+        
+        return audio, duration, rms
     
-    # تحميل 3 عينات بالتوازي
-    raws = await asyncio.gather(audio_1.read(), audio_2.read(), audio_3.read())
-    
-    loop = asyncio.get_event_loop()
-    
-    # تحويل الصوت بالتوازي
-    wavs = await asyncio.gather(
-        loop.run_in_executor(executor, load_audio, raws[0]),
-        loop.run_in_executor(executor, load_audio, raws[1]),
-        loop.run_in_executor(executor, load_audio, raws[2]),
+    samples = await asyncio.gather(
+        load_sample(audio_1, 1),
+        load_sample(audio_2, 2),
+        load_sample(audio_3, 3)
     )
     
-    # التحقق من مدة الصوت
-    for i, w in enumerate(wavs, 1):
-        dur = len(w) / SR
-        if dur < 1.0:
-            raise HTTPException(400, f"Sample {i}: too short ({dur:.1f}s, need ≥1s)")
+    audios = [s[0] for s in samples]
     
-    # استخراج البصمات
-    embeddings = [extract_embedding(w) for w in wavs]
+    # Extract embeddings
+    embeddings = []
+    for audio in audios:
+        emb = await asyncio.get_event_loop().run_in_executor(_EXECUTOR, get_embedding, audio)
+        embeddings.append(emb)
     
-    # Cross-check: التأكد إن العينات لنفس الشخص
-    s12 = float(np.dot(embeddings[0], embeddings[1]))
-    s13 = float(np.dot(embeddings[0], embeddings[2]))
-    s23 = float(np.dot(embeddings[1], embeddings[2]))
+    # Average embeddings
+    final_embedding = np.mean(embeddings, axis=0)
+    norm = np.linalg.norm(final_embedding)
+    final_embedding = (final_embedding / norm).tolist() if norm > 0 else final_embedding.tolist()
     
-    min_score = min(s12, s13, s23)
-    
-    if min_score < 0.65:
-        raise HTTPException(
-            400,
-            f"Samples don't match! Scores: s12={s12:.3f} s13={s13:.3f} s23={s23:.3f}. "
-            "Re-record with the same person."
-        )
-    
-    # متوسط البصمات
-    final = np.mean(embeddings, axis=0)
-    final = final / (np.linalg.norm(final) + 1e-8)
-    
-    # تخزين
-    db[user_id] = {
+    # Save to database
+    user_data = {
+        "embedding": final_embedding,
         "name": user_name or user_id,
-        "embedding": final.tolist(),
-        "enrolled_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "enrolled_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
+    _db[user_id] = user_data
+    await asyncio.get_event_loop().run_in_executor(_EXECUTOR, _save_user, user_id, user_data)
     
-    ms = int((time.time() - t0) * 1000)
-    log.info(f"✅ ENROLL {user_id} | cross={min_score:.3f} | {ms}ms")
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    log.info(f"Enrolled {user_id} in {elapsed_ms}ms")
     
     return {
-        "ok": True,
+        "success": True,
         "user_id": user_id,
-        "name": user_name or user_id,
-        "cross_check": {"s12": round(s12, 4), "s13": round(s13, 4), "s23": round(s23, 4)},
-        "embedding_dim": len(final),
-        "ms": ms,
+        "name": user_data["name"],
+        "dimension": 512,
+        "enrolled_at": user_data["enrolled_at"],
+        "processing_ms": elapsed_ms
     }
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# VERIFY
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/verify")
 async def verify(
@@ -232,96 +411,72 @@ async def verify(
     audio: UploadFile = File(...),
     threshold: float = Form(THRESHOLD),
 ):
-    """
-    التحقق من الهوية
+    """Verify a user's identity against their enrolled voice print"""
+    if not _model_ready:
+        raise HTTPException(503, f"Model not ready: {_model_error}")
     
-    - يقارن العينة بالبصمة المخزنة لـ user_id ده فقط
-    - مبيعملش بحث في كل المستخدمين
-    """
-    if not model_ready:
-        raise HTTPException(503, "Model not ready")
+    if user_id not in _db:
+        raise HTTPException(404, f"User '{user_id}' not found. Please enroll first.")
     
-    if user_id not in db:
-        raise HTTPException(404, f"User '{user_id}' not enrolled. Use /enroll first.")
-    
-    t0 = time.time()
+    start_time = time.time()
     
     raw = await audio.read()
+    try:
+        wav = await asyncio.get_event_loop().run_in_executor(_EXECUTOR, load_audio, raw)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid audio: {str(e)}")
     
-    loop = asyncio.get_event_loop()
-    wav = await loop.run_in_executor(executor, load_audio, raw)
+    duration = len(wav) / SR
+    if duration < 0.5:
+        raise HTTPException(400, f"Audio too short ({duration:.2f}s), need ≥0.5s")
     
-    dur = len(wav) / SR
-    if dur < 0.5:
-        raise HTTPException(400, f"Audio too short ({dur:.1f}s)")
+    new_embedding = await asyncio.get_event_loop().run_in_executor(_EXECUTOR, get_embedding, wav)
+    stored_embedding = np.array(_db[user_id]["embedding"])
     
-    new_emb = extract_embedding(wav)
-    stored_emb = np.array(db[user_id]["embedding"], dtype=np.float32)
+    score = await asyncio.get_event_loop().run_in_executor(
+        _EXECUTOR, cosine_similarity, new_embedding, stored_embedding
+    )
     
-    score = float(np.dot(new_emb, stored_emb))
-    match = score >= threshold
+    is_match = score >= threshold
+    elapsed_ms = int((time.time() - start_time) * 1000)
     
-    ms = int((time.time() - t0) * 1000)
-    log.info(f"{'✅' if match else '❌'} VERIFY {user_id} | score={score:.4f} | {ms}ms")
+    log.info(f"Verified {user_id}: score={score:.4f}, match={is_match}, ms={elapsed_ms}")
     
     return {
-        "ok": True,
-        "match": match,
+        "success": True,
+        "match": is_match,
         "score": round(score, 4),
-        "score_pct": f"{round(score * 100, 1)}%",
+        "score_percent": f"{score * 100:.1f}%",
         "threshold": threshold,
         "user_id": user_id,
-        "name": db[user_id]["name"],
-        "ms": ms,
+        "duration_sec": round(duration, 2),
+        "processing_ms": elapsed_ms
     }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# USERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.get("/users")
-async def list_users():
-    """قائمة المستخدمين المسجلين"""
-    return {
-        "ok": True,
-        "count": len(db),
-        "users": [
-            {"user_id": uid, "name": info["name"], "enrolled_at": info["enrolled_at"]}
-            for uid, info in db.items()
-        ],
-    }
-
-
-@app.get("/users/{user_id}/embedding")
-async def get_embedding(user_id: str):
-    """جلب البصمة المخزنة (للحفظ في قاعدة بيانات خارجية)"""
-    if user_id not in db:
-        raise HTTPException(404, f"User '{user_id}' not found")
-    return {
-        "ok": True,
-        "user_id": user_id,
-        "embedding": db[user_id]["embedding"],
-    }
-
-
-@app.delete("/users/{user_id}")
-async def delete_user(user_id: str):
-    """حذف مستخدم"""
-    if user_id not in db:
-        raise HTTPException(404, f"User '{user_id}' not found")
-    del db[user_id]
-    return {"ok": True, "deleted": user_id}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": model_ready, "users": len(db)}
+    """Health check endpoint"""
+    return {
+        "status": "healthy" if _model_ready else "degraded",
+        "model_ready": _model_ready,
+        "enrolled_users": len(_db),
+        "sample_rate": SR,
+        "default_threshold": THRESHOLD
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 if __name__ == "__main__":
-    import uvicorn
-    log.info(f"Starting VoxGuard on port {PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    log.info("=" * 50)
+    log.info("VoxGuard Voice Biometric API")
+    log.info(f"Port: {PORT}")
+    log.info(f"Model: {'READY' if _model_ready else 'FAILED'}")
+    log.info(f"Enrolled users: {len(_db)}")
+    log.info(f"Health: http://localhost:{PORT}/health")
+    log.info("=" * 50)
+    
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
