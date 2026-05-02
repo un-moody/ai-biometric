@@ -13,6 +13,8 @@ import torch
 warnings.filterwarnings("ignore")
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# منع الاتصال بالإنترنت لتحميل النماذج
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("VG")
@@ -21,13 +23,25 @@ SR = 16000
 THRESHOLD = float(os.environ.get("VG_THRESHOLD", "0.72"))
 PORT = int(os.environ.get("PORT", "8000"))
 
+# المسار المحلي للنموذج
+MODEL_PATH = os.environ.get("VG_MODEL_PATH", "./wavlm_local")
+
 _wavlm_model, _wavlm_ext, _wavlm_ok, _load_err = None, None, False, ""
 
 def _load_wavlm():
     global _wavlm_model, _wavlm_ext, _load_err
     try:
-        _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv")
-        _wavlm_model = WavLMForXVector.from_pretrained("microsoft/wavlm-base-plus-sv").eval()
+        t0 = time.time()
+        log.info(f"Loading WavLM from local path: {MODEL_PATH}")
+        _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained(
+            MODEL_PATH, 
+            local_files_only=True
+        )
+        _wavlm_model = WavLMForXVector.from_pretrained(
+            MODEL_PATH, 
+            local_files_only=True
+        ).eval()
+        log.info(f"✅ WavLM loaded in {int((time.time()-t0)*1000)}ms")
         return True
     except Exception as e:
         _load_err = str(e)
@@ -57,16 +71,14 @@ def cosine_sim(a, b):
     na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
     return 0.0 if na < 1e-8 or nb < 1e-8 else float(np.dot(a, b) / (na * nb))
 
-log.info("Loading WavLM...")
 _wavlm_ok = _load_wavlm()
-log.info(f"WavLM: {'OK' if _wavlm_ok else 'FAILED'}")
 
 app = FastAPI(title="VoxGuard API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "wavlm": _wavlm_ok}
+    return {"ok": True, "wavlm": _wavlm_ok, "model_path": MODEL_PATH}
 
 @app.post("/enroll")
 async def enroll(
@@ -75,7 +87,7 @@ async def enroll(
     audio_2: UploadFile = File(...),
     audio_3: UploadFile = File(...),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
     t0 = time.time()
     embeddings = []
     for f in [audio_1, audio_2, audio_3]:
@@ -97,7 +109,7 @@ async def verify_embedding(
     embedding: str = Form(...),
     threshold: float = Form(0.72),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
     try:
         saved_emb = np.array(json.loads(embedding), dtype=np.float32)
     except:
@@ -119,4 +131,5 @@ async def catch_all(path: str):
 
 if __name__ == "__main__":
     import uvicorn
+    log.info(f"🚀 Starting VoxGuard on port {PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
