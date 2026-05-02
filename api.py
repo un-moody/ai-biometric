@@ -47,11 +47,11 @@ def load_wav(raw):
             from math import gcd
             g = gcd(sr, SR)
             arr = resample_poly(arr, SR // g, sr // g).astype(np.float32)
-        return arr
+        return arr[:SR*4]  # أول 4 ثواني
     except:
         import librosa
         arr, _ = librosa.load(io.BytesIO(raw), sr=SR, mono=True)
-        return arr.astype(np.float32)
+        return arr.astype(np.float32)[:SR*4]  # أول 4 ثواني
 
 def cosine_sim(a, b):
     na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
@@ -75,7 +75,7 @@ async def enroll(
     audio_2: UploadFile = File(...),
     audio_3: UploadFile = File(...),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded")
     t0 = time.time()
     embeddings = []
     for f in [audio_1, audio_2, audio_3]:
@@ -85,14 +85,10 @@ async def enroll(
         embeddings.append(emb)
     final = np.mean(embeddings, axis=0)
     n = float(np.linalg.norm(final))
-    if n > 1e-8:
-        final = final / n
+    if n > 1e-8: final = final / n
     return {
-        "ok": True,
-        "user_id": user_id,
-        "dim": int(len(final)),
-        "embedding": final.tolist(),
-        "ms": int((time.time() - t0) * 1000)
+        "ok": True, "user_id": user_id, "dim": int(len(final)),
+        "embedding": final.tolist(), "ms": int((time.time()-t0)*1000)
     }
 
 @app.post("/verify_embedding")
@@ -101,11 +97,11 @@ async def verify_embedding(
     embedding: str = Form(...),
     threshold: float = Form(0.72),
 ):
-    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded: {_load_err}")
+    if not _wavlm_ok: raise HTTPException(503, f"Model not loaded")
     try:
         saved_emb = np.array(json.loads(embedding), dtype=np.float32)
-    except Exception:
-        raise HTTPException(400, "Invalid embedding JSON")
+    except:
+        raise HTTPException(400, "Invalid embedding")
     t0 = time.time()
     raw = await audio.read()
     wav = load_wav(raw)
@@ -113,11 +109,8 @@ async def verify_embedding(
     score = cosine_sim(new_emb, saved_emb)
     match = bool(score >= threshold)
     return {
-        "ok": True,
-        "match": match,
-        "score": round(float(score), 4),
-        "sos_trigger": match,
-        "ms": int((time.time() - t0) * 1000)
+        "ok": True, "match": match, "score": round(float(score), 4),
+        "sos_trigger": match, "ms": int((time.time()-t0)*1000)
     }
 
 @app.api_route("/{path:path}")
