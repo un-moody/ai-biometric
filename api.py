@@ -3,6 +3,12 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from transformers import WavLMForXVector, Wav2Vec2FeatureExtractor
+import soundfile as sf
+from scipy.signal import resample_poly
+from math import gcd
+import librosa
+import torch
 
 warnings.filterwarnings("ignore")
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -20,7 +26,6 @@ _wavlm_model, _wavlm_ext, _wavlm_ok, _load_err = None, None, False, ""
 def _load_wavlm():
     global _wavlm_model, _wavlm_ext, _load_err
     try:
-        from transformers import WavLMForXVector, Wav2Vec2FeatureExtractor
         _wavlm_ext = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv")
         _wavlm_model = WavLMForXVector.from_pretrained("microsoft/wavlm-base-plus-sv").eval()
         return True
@@ -29,7 +34,6 @@ def _load_wavlm():
         return False
 
 def get_embedding(audio):
-    import torch
     with torch.no_grad():
         inp = _wavlm_ext(audio, sampling_rate=SR, return_tensors="pt", padding=True)
         emb = _wavlm_model(**inp).embeddings.squeeze().cpu().numpy().astype(np.float32)
@@ -39,19 +43,15 @@ def get_embedding(audio):
 def load_wav(raw):
     if not raw: raise ValueError("empty audio")
     try:
-        import soundfile as sf
         arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
         if arr.ndim > 1: arr = arr.mean(axis=1)
         if sr != SR:
-            from scipy.signal import resample_poly
-            from math import gcd
             g = gcd(sr, SR)
             arr = resample_poly(arr, SR // g, sr // g).astype(np.float32)
-        return arr[:SR*4]  # أول 4 ثواني
+        return arr[:SR*4]
     except:
-        import librosa
         arr, _ = librosa.load(io.BytesIO(raw), sr=SR, mono=True)
-        return arr.astype(np.float32)[:SR*4]  # أول 4 ثواني
+        return arr.astype(np.float32)[:SR*4]
 
 def cosine_sim(a, b):
     na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
